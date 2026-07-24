@@ -176,6 +176,12 @@ class NymeaClient:
         """Authenticate and establish session."""
         try:
             _LOGGER.debug("Starting authentication process")
+            
+            # Force close any existing connection before attempting new authentication
+            if self._writer or self._reader:
+                _LOGGER.debug("Closing existing connection before authentication")
+                await self.close_connection()
+            
             await self._connect()
             await self._handshake()
 
@@ -195,17 +201,26 @@ class NymeaClient:
             _LOGGER.debug("Authentication response received")
 
             auth_data = json.loads(auth_response)
+            
+            # Check for success in the response
             if not auth_data.get("params", {}).get("success", False):
-                _LOGGER.error("Authentication failed: Invalid credentials or server error")
-                raise ValueError("Authentication failed.")
+                error_msg = auth_data.get("error", "Invalid credentials or server error")
+                _LOGGER.error("Authentication failed: %s", error_msg)
+                await self.close_connection()
+                raise ValueError(f"Authentication failed: {error_msg}")
                 
             self._token = auth_data["params"]["token"]
             _LOGGER.info("Successfully authenticated and received token")
 
-        except Exception as e:
+        except ValueError as e:
+            # Re-raise ValueError as-is (our own error messages)
             _LOGGER.error("Authentication error: %s", e)
             await self.close_connection()
             raise
+        except Exception as e:
+            _LOGGER.error("Unexpected authentication error: %s", e, exc_info=True)
+            await self.close_connection()
+            raise ValueError(f"Authentication failed: {str(e)}") from e
         
     async def close_connection(self):
         """Close the writer connection gracefully, with fallback to forceful closure."""
