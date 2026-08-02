@@ -266,7 +266,7 @@ class NymeaClient:
                 "Integrations.ExecuteAction", params, response_timeout=5
             )
         except NymeaRequestTimeout:
-            _LOGGER.warning(
+            _LOGGER.info(
                 "Nymea action %s was not confirmed in time; keeping the "
                 "connection open and refreshing its state",
                 action_type_id,
@@ -275,7 +275,7 @@ class NymeaClient:
         result = response.get("params", {})
         thing_error = result.get("thingError")
         if thing_error == "ThingErrorTimeout":
-            _LOGGER.warning(
+            _LOGGER.info(
                 "Nymea action %s returned ThingErrorTimeout; the command may "
                 "still have been applied and its state will be refreshed",
                 action_type_id,

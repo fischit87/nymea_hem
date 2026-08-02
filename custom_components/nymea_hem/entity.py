@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import math
 from typing import Any
 
 from homeassistant.helpers.device_registry import DeviceInfo
@@ -10,12 +12,26 @@ from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import DOMAIN
 
+_LOGGER = logging.getLogger(__name__)
+
 NUMERIC_TYPES = {"Double", "Int", "Uint"}
 
 
 def value_type_matches(state_type: dict[str, Any], param_type: dict[str, Any]) -> bool:
     """Return whether a generated action parameter can write a state."""
     return state_type.get("type") == param_type.get("type")
+
+
+def values_match(actual: Any, expected: Any) -> bool:
+    """Compare a read-back value with the requested value."""
+    if (
+        isinstance(actual, (int, float))
+        and not isinstance(actual, bool)
+        and isinstance(expected, (int, float))
+        and not isinstance(expected, bool)
+    ):
+        return math.isclose(float(actual), float(expected), rel_tol=1e-9, abs_tol=1e-9)
+    return actual == expected
 
 
 def find_state_action(
@@ -104,6 +120,7 @@ class NymeaEntity(CoordinatorEntity):
         self,
         action_type: dict[str, Any],
         param_type: dict[str, Any],
+        state_type_id: str,
         value: Any,
     ) -> None:
         confirmed = await self._client.execute_action(
@@ -116,6 +133,22 @@ class NymeaEntity(CoordinatorEntity):
             # moment before reading back the authoritative state.
             await asyncio.sleep(2)
         await self.coordinator.async_request_refresh()
+        if not confirmed:
+            state = self._state(state_type_id)
+            actual_value = state.get("value") if state else None
+            if values_match(actual_value, value):
+                _LOGGER.info(
+                    "Unconfirmed nymea action %s was verified by state read-back",
+                    action_type["id"],
+                )
+            else:
+                _LOGGER.warning(
+                    "Nymea action %s timed out and state verification failed: "
+                    "requested=%r actual=%r",
+                    action_type["id"],
+                    value,
+                    actual_value,
+                )
 
 
 class NymeaWritableStateEntity(NymeaEntity):
@@ -147,5 +180,8 @@ class NymeaWritableStateEntity(NymeaEntity):
 
     async def _write(self, value: Any) -> None:
         await self._set_state(
-            self._action_type, self._param_type, value
+            self._action_type,
+            self._param_type,
+            self._state_type["id"],
+            value,
         )
