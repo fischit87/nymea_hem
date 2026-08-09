@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Mit Nymea HEM verbinden",
+        "description": "Konfiguriere die Verbindung zum Nymea-Gerät.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "username": "Benutzername",
+          "password": "Passwort",
+          "ssl": "SSL verwenden",
+          "poll_interval": "Abfrageintervall (Sekunden)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Nymea HEM neu authentifizieren",
+        "description": "Nymea hat die gespeicherten Zugangsdaten abgelehnt. Gib gültige Zugangsdaten ein.",
+        "data": {
+          "username": "Benutzername",
+          "password": "Passwort"
+        }
+      },
+      "reconfigure": {
+        "title": "Nymea HEM neu konfigurieren",
+        "description": "Verbindungs- und Abfrageeinstellungen aktualisieren.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "ssl": "SSL verwenden",
+          "poll_interval": "Abfrageintervall (Sekunden)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Verbindung zu Nymea fehlgeschlagen.",
+      "invalid_auth": "Nymea hat Benutzername oder Passwort abgelehnt.",
+      "unknown": "Unerwarteter Nymea-Fehler."
+    },
+    "abort": {
+      "reauth_successful": "Erneute Authentifizierung war erfolgreich.",
+      "reconfigure_successful": "Neukonfiguration war erfolgreich."
+    }
+  }
+}
