@@ -6,17 +6,36 @@ import asyncio
 import json
 import logging
 import ssl
-from typing import Any
+import time
+from typing import Any, Callable
 
 _LOGGER = logging.getLogger(__name__)
+
+BACKOFF_DELAYS = (60.0, 120.0, 240.0, 300.0)
 
 
 class NymeaError(Exception):
     """Base exception raised by the nymea client."""
 
 
+class NymeaConnectionError(NymeaError):
+    """The transport is unavailable or a reconnect is cooling down."""
+
+    def __init__(self, message: str, *, retry_after: float | None = None) -> None:
+        super().__init__(message)
+        self.retry_after = retry_after
+
+
 class NymeaRequestTimeout(NymeaError):
     """The server did not answer a request within the expected time."""
+
+
+class NymeaAuthenticationError(NymeaError):
+    """The server definitively rejected authentication."""
+
+
+class NymeaRpcError(NymeaError):
+    """Nymea returned an error for an otherwise completed RPC request."""
 
 
 class NymeaClient:
@@ -29,6 +48,8 @@ class NymeaClient:
         username: str,
         password: str,
         ssl_enabled: bool = True,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._host = host
         self._port = port
@@ -42,13 +63,43 @@ class NymeaClient:
         self._read_timeout = 15
         self._request_id = 0
         self._receive_buffer = ""
-        # A StreamReader may only have one active reader. All requests, including
-        # reconnect/authentication, therefore share one lock.
+        # StreamReader only permits one active reader. Reconnect, authentication,
+        # polling and actions therefore share this lock for their entire exchange.
         self._request_lock = asyncio.Lock()
         self._server_info: dict[str, Any] = {}
+        self._session_ready = False
+        self._authentication_blocked = False
+        self._consecutive_read_timeouts = 0
+        self._reconnect_failures = 0
+        self._next_reconnect_at = 0.0
+        self._monotonic = monotonic
+
+    @property
+    def authentication_blocked(self) -> bool:
+        """Return whether credentials were definitively rejected."""
+        return self._authentication_blocked
+
+    @property
+    def reconnect_failures(self) -> int:
+        """Return the number of consecutive recovery failures."""
+        return self._reconnect_failures
+
+    @property
+    def next_reconnect_at(self) -> float:
+        """Return the monotonic timestamp of the next permitted reconnect."""
+        return self._next_reconnect_at
+
+    @property
+    def consecutive_read_timeouts(self) -> int:
+        """Return consecutive response timeouts for the current session."""
+        return self._consecutive_read_timeouts
 
     def is_connected(self) -> bool:
-        """Return whether the socket is open."""
+        """Return whether the socket is open.
+
+        This only describes transport state. A usable session additionally needs
+        ``_session_ready`` and must not be in an authentication-blocked state.
+        """
         return bool(
             self._reader
             and self._writer
@@ -59,17 +110,51 @@ class NymeaClient:
         self._request_id += 1
         return self._request_id
 
-    def _create_ssl_context(self) -> ssl.SSLContext:
-        """Create a TLS context without loading system certificates.
+    def _safe_error_detail(self, value: Any) -> str:
+        """Return a server error string with locally known secrets removed."""
+        detail = str(value) if value else "unknown RPC error"
+        for secret in (self._password, self._token):
+            if secret:
+                detail = detail.replace(secret, "[redacted]")
+        return detail
 
-        Consolinno appliances commonly use a self-signed certificate. Building
-        this minimal context also avoids blocking certificate-store I/O in HA's
-        event loop.
-        """
+    def _create_ssl_context(self) -> ssl.SSLContext:
+        """Create a TLS context suitable for a self-signed local appliance."""
         context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
         context.check_hostname = False
         context.verify_mode = ssl.CERT_NONE
         return context
+
+    def _raise_if_reconnect_not_allowed(self) -> None:
+        if self._authentication_blocked:
+            raise NymeaAuthenticationError(
+                "Nymea rejected the configured credentials; "
+                "reauthentication is required"
+            )
+        remaining = self._next_reconnect_at - self._monotonic()
+        if remaining > 0:
+            raise NymeaConnectionError(
+                f"Nymea reconnect is cooling down for {remaining:.1f} seconds",
+                retry_after=remaining,
+            )
+
+    def _record_recovery_failure(self) -> None:
+        """Advance the reconnect circuit breaker after an actual I/O attempt."""
+        self._reconnect_failures += 1
+        delay = BACKOFF_DELAYS[
+            min(self._reconnect_failures - 1, len(BACKOFF_DELAYS) - 1)
+        ]
+        self._next_reconnect_at = self._monotonic() + delay
+        _LOGGER.debug(
+            "Nymea connection recovery delayed for %.0f seconds after failure %d",
+            delay,
+            self._reconnect_failures,
+        )
+
+    def _reset_recovery_state(self) -> None:
+        self._consecutive_read_timeouts = 0
+        self._reconnect_failures = 0
+        self._next_reconnect_at = 0.0
 
     async def _connect_locked(self) -> None:
         if self.is_connected():
@@ -84,16 +169,17 @@ class NymeaClient:
                 timeout=self._connection_timeout,
             )
         except (asyncio.TimeoutError, OSError) as err:
-            raise ConnectionError(
-                f"Could not connect to {self._host}:{self._port}: {err}"
+            raise NymeaConnectionError(
+                f"Could not connect to {self._host}:{self._port}"
             ) from err
         _LOGGER.info("Successfully connected to %s:%d", self._host, self._port)
 
     async def _read_response_locked(
         self, request_id: int, timeout: float | None = None
     ) -> dict[str, Any]:
-        """Read JSON objects until the response for request_id arrives."""
-        assert self._reader is not None
+        """Read JSON objects until the response for ``request_id`` arrives."""
+        if self._reader is None:
+            raise NymeaConnectionError("Nymea connection has no reader")
         decoder = json.JSONDecoder()
         read_timeout = self._read_timeout if timeout is None else timeout
         while True:
@@ -121,11 +207,21 @@ class NymeaClient:
                 )
             except asyncio.TimeoutError as err:
                 raise NymeaRequestTimeout(
-                    f"No response for request {request_id} within {read_timeout} seconds"
+                    f"No response for request {request_id} within "
+                    f"{read_timeout} seconds"
+                ) from err
+            except (ConnectionError, OSError) as err:
+                raise NymeaConnectionError(
+                    "Nymea connection failed while reading a response"
                 ) from err
             if not chunk:
-                raise ConnectionError("Connection closed by remote host")
-            self._receive_buffer += chunk.decode()
+                raise NymeaConnectionError("Connection closed by remote host")
+            try:
+                self._receive_buffer += chunk.decode()
+            except UnicodeDecodeError as err:
+                raise NymeaConnectionError(
+                    "Nymea returned an invalid response encoding"
+                ) from err
 
     async def _send_locked(
         self,
@@ -135,7 +231,8 @@ class NymeaClient:
         include_token: bool = True,
         response_timeout: float | None = None,
     ) -> dict[str, Any]:
-        assert self._writer is not None
+        if self._writer is None:
+            raise NymeaConnectionError("Nymea connection has no writer")
         request_id = self._next_request_id()
         request: dict[str, Any] = {"id": request_id, "method": method}
         if params is not None:
@@ -143,18 +240,29 @@ class NymeaClient:
         if include_token and self._token:
             request["token"] = self._token
 
-        # Never log the authentication token or password.
+        # Do not log params: authentication params contain the password, and the
+        # serialized request can contain a token.
         _LOGGER.debug("Sending nymea request id=%s method=%s", request_id, method)
-        self._writer.write((json.dumps(request) + "\n").encode())
-        await self._writer.drain()
+        try:
+            self._writer.write((json.dumps(request) + "\n").encode())
+            await self._writer.drain()
+        except (ConnectionError, OSError) as err:
+            raise NymeaConnectionError(
+                f"Nymea connection failed while sending {method}"
+            ) from err
+
         response = await self._read_response_locked(request_id, response_timeout)
-        if response.get("status") != "success":
-            raise NymeaError(
-                f"{method} failed: {response.get('error', 'Unknown error')}"
-            )
+        status = response.get("status")
+        if status == "unauthorized":
+            raise NymeaAuthenticationError("Nymea rejected authentication")
+        if status != "success":
+            detail = self._safe_error_detail(response.get("error"))
+            raise NymeaRpcError(f"{method} failed: {detail}")
         return response
 
     async def _authenticate_locked(self) -> None:
+        """Build a fresh session; callers handle failure state and cooldown."""
+        # A complete login must never reuse a socket, receive buffer or token.
         await self._close_locked()
         await self._connect_locked()
         hello = await self._send_locked("JSONRPC.Hello", include_token=False)
@@ -171,33 +279,50 @@ class NymeaClient:
             "uuid": hello_params.get("uuid"),
             "version": hello_params.get("version"),
         }
-        auth = await self._send_locked(
-            "JSONRPC.Authenticate",
-            {
-                "username": self._username,
-                "password": self._password,
-                "deviceName": "HomeAssistant",
-            },
-            include_token=False,
-        )
-        auth_params = auth.get("params", {})
-        if not auth_params.get("success", False) or not auth_params.get("token"):
-            raise NymeaError("Authentication failed")
-        self._token = auth_params["token"]
+
+        if hello_params.get("authenticationRequired", True):
+            auth = await self._send_locked(
+                "JSONRPC.Authenticate",
+                {
+                    "username": self._username,
+                    "password": self._password,
+                    "deviceName": "HomeAssistant",
+                },
+                include_token=False,
+            )
+            auth_params = auth.get("params", {})
+            if not auth_params.get("success", False) or not auth_params.get("token"):
+                raise NymeaAuthenticationError(
+                    "Nymea rejected the configured credentials"
+                )
+            self._token = auth_params["token"]
+
+        self._session_ready = True
+        self._consecutive_read_timeouts = 0
         _LOGGER.info(
             "Authenticated with %s (version %s)",
             self._server_info.get("name"),
             self._server_info.get("version"),
         )
 
+    async def _establish_session_locked(self) -> None:
+        """Authenticate once, applying the shared circuit breaker on failure."""
+        self._raise_if_reconnect_not_allowed()
+        try:
+            await self._authenticate_locked()
+        except NymeaAuthenticationError:
+            self._authentication_blocked = True
+            await self._close_locked()
+            raise
+        except (NymeaConnectionError, NymeaRequestTimeout, NymeaRpcError):
+            await self._close_locked()
+            self._record_recovery_failure()
+            raise
+
     async def authenticate(self) -> None:
         """Create a fresh authenticated session."""
         async with self._request_lock:
-            try:
-                await self._authenticate_locked()
-            except Exception:
-                await self._close_locked()
-                raise
+            await self._establish_session_locked()
 
     async def _rpc_call(
         self,
@@ -207,26 +332,45 @@ class NymeaClient:
         response_timeout: float | None = None,
     ) -> dict[str, Any]:
         async with self._request_lock:
+            if self._authentication_blocked:
+                raise NymeaAuthenticationError(
+                    "Nymea reauthentication is required"
+                )
+            if not self.is_connected() or not self._session_ready:
+                await self._establish_session_locked()
+
             try:
-                if not self.is_connected() or not self._token:
-                    await self._authenticate_locked()
-                return await self._send_locked(
+                response = await self._send_locked(
                     method, params, response_timeout=response_timeout
                 )
             except NymeaRequestTimeout:
-                # A timed-out command may still be running on the appliance.
-                # Keep the healthy socket open so a late response can be
-                # discarded by request id and the state can be read back.
+                self._consecutive_read_timeouts += 1
+                if self._consecutive_read_timeouts >= 2:
+                    await self._close_locked()
+                    self._record_recovery_failure()
+                # The first timeout deliberately keeps the socket. A late reply
+                # is ignored by request id during the next serialized exchange.
                 raise
-            except Exception:
+            except NymeaAuthenticationError:
+                self._authentication_blocked = True
                 await self._close_locked()
                 raise
+            except NymeaConnectionError:
+                await self._close_locked()
+                self._record_recovery_failure()
+                raise
+
+            self._consecutive_read_timeouts = 0
+            if method == "Integrations.GetThings":
+                # Only a completed state poll proves end-to-end recovery.
+                self._reset_recovery_state()
+            return response
 
     async def get_things(self) -> list[dict[str, Any]]:
         """Retrieve all configured things."""
         response = await self._rpc_call("Integrations.GetThings")
         things = response.get("params", {}).get("things", [])
-        _LOGGER.info("Retrieved %d devices from Nymea", len(things))
+        _LOGGER.debug("Retrieved %d devices from Nymea", len(things))
         return things
 
     async def get_thing_class_details(
@@ -246,8 +390,9 @@ class NymeaClient:
     ) -> bool:
         """Execute an action and return whether nymea confirmed completion.
 
-        Consolinno may apply a command but either answer late or return
-        ThingErrorTimeout. Both cases mean "unconfirmed", not "rejected".
+        Actions use a shorter response timeout. An unconfirmed action returns
+        ``False`` to preserve read-back handling, while the shared two-timeout
+        health policy still discards a repeatedly unresponsive session.
         """
         params: dict[str, Any] = {
             "thingId": thing_id,
@@ -267,8 +412,8 @@ class NymeaClient:
             )
         except NymeaRequestTimeout:
             _LOGGER.info(
-                "Nymea action %s was not confirmed in time; keeping the "
-                "connection open and refreshing its state",
+                "Nymea action %s was not confirmed in time; its state will be "
+                "read back",
                 action_type_id,
             )
             return False
@@ -283,7 +428,9 @@ class NymeaClient:
             return False
         if thing_error not in (None, "ThingErrorNoError", 0):
             message = result.get("displayMessage") or thing_error
-            raise NymeaError(f"Action failed: {message}")
+            raise NymeaRpcError(
+                f"Action failed: {self._safe_error_detail(message)}"
+            )
         _LOGGER.info("Nymea action %s completed successfully", action_type_id)
         return True
 
@@ -292,7 +439,9 @@ class NymeaClient:
         self._reader = None
         self._writer = None
         self._token = None
+        self._session_ready = False
         self._receive_buffer = ""
+        self._consecutive_read_timeouts = 0
         if writer:
             writer.close()
             try:
@@ -301,6 +450,6 @@ class NymeaClient:
                 pass
 
     async def close_connection(self) -> None:
-        """Close the connection safely."""
+        """Close the connection safely and discard the session token."""
         async with self._request_lock:
             await self._close_locked()

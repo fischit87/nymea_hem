@@ -1,0 +1,45 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Connect to Nymea HEM",
+        "description": "Configure the connection to your Nymea appliance.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "username": "Username",
+          "password": "Password",
+          "ssl": "Use SSL",
+          "poll_interval": "Poll interval (seconds)"
+        }
+      },
+      "reauth_confirm": {
+        "title": "Reauthenticate Nymea HEM",
+        "description": "Nymea rejected the stored credentials. Enter valid credentials to continue.",
+        "data": {
+          "username": "Username",
+          "password": "Password"
+        }
+      },
+      "reconfigure": {
+        "title": "Reconfigure Nymea HEM",
+        "description": "Update the connection and polling settings.",
+        "data": {
+          "host": "Host",
+          "port": "Port",
+          "ssl": "Use SSL",
+          "poll_interval": "Poll interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Unable to connect to Nymea.",
+      "invalid_auth": "Nymea rejected the username or password.",
+      "unknown": "Unexpected Nymea error."
+    },
+    "abort": {
+      "reauth_successful": "Reauthentication was successful.",
+      "reconfigure_successful": "Reconfiguration was successful."
+    }
+  }
+}
